@@ -1,0 +1,9 @@
+version: '3.8'
+
+services:
+  segmenter:
+    build: .
+    container_name: pdi_segmenter
+    volumes:
+      - .:/app
+    command: ["--input", "Train_and_Validation", "--output", "resultado"]

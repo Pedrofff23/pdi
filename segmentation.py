@@ -26,83 +26,127 @@ def segment_image(img_path, output_dir, img_name):
     img_color = cv2.imread(img_path, cv2.IMREAD_COLOR)
 
     # 1. Definição da Região de Interesse (ROI) horizontal
-    # As imagens têm resolução 1280x720. As bordas laterais (x < 250 e x > 1030)
-    # contêm a esteira transportadora e as abas da caixa de papelão (onde há logotipos de marcas).
-    # Criamos uma máscara para analisar apenas o centro onde ficam as embalagens, evitando falsos positivos.
     mask = np.zeros_like(img)
     mask[:, 250:1030] = 255
     masked_img = cv2.bitwise_and(img, mask)
 
-    # 2. Binarização Dinâmica por Percentil
-    # Como as condições de iluminação variam e os rótulos são sempre as partes
-    # mais claras da imagem dentro da caixa, calculamos o percentil 90 dos pixels da ROI.
-    # Isso define um limiar adaptativo de alta intensidade para cada imagem individualmente.
     pixels_inside = img[:, 250:1030].flatten()
     if len(pixels_inside) == 0:
         return 0
-    thresh_val = np.percentile(pixels_inside, 90)
-    _, thresh = cv2.threshold(masked_img, thresh_val, 255, cv2.THRESH_BINARY)
 
-    # 3. Operação Morfológica (Fechamento)
-    # Rótulos contêm textos e códigos de barras (pixels escuros sobre fundo claro).
-    # O fechamento morfológico com um elemento estruturante retangular (15x15)
-    # preenche os "buracos" pretos do texto e unifica as letras em blocos sólidos de máscara.
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
-    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    candidates = []
 
-    # 4. Extração de Contornos
-    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # 2. Limiarização Dinâmica com Fallback
+    # Tentamos encontrar candidatos primeiro com Percentile 90 e kernel 15x15.
+    # Se falhar, caímos para percentis mais baixos para garantir detecção em condições extremas de luz.
+    for p in [90, 85, 80]:
+        thresh_val = np.percentile(pixels_inside, p)
+        _, thresh = cv2.threshold(masked_img, thresh_val, 255, cv2.THRESH_BINARY)
 
-    crop_count = 0
-    for c in contours:
-        x, y, w, h = cv2.boundingRect(c)
-        area = w * h
-        cx = x + w/2
+        # 3. Operação Morfológica (Fechamento)
+        # O fechamento morfológico com um elemento estruturante retangular (15x15)
+        # preenche os buracos pretos do texto e unifica as letras em blocos sólidos.
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+        closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
 
-        # 5. Filtragem por Tamanho, Área e Posição (na caixa central)
-        # Rótulos reais de produtos avícolas têm tamanhos previsíveis na imagem:
-        # - Largura e altura entre 60 e 350 pixels.
-        # - Área total entre 4.000 e 80.000 pixels quadrados.
-        # - O centro do rótulo deve estar dentro do limite central (250 < cx < 1030).
-        if w >= 60 and h >= 60 and area >= 4000 and w < 350 and h < 350:
-            if 250 < cx < 1030:
-                # Extrai a região candidata não acolchoada para verificação de textura/contraste
-                crop_gray_unpadded = img[y:y+h, x:x+w]
-                
-                # 6. Filtragem por Textura, Contraste e Relação de Pixels Escuros (Falsos Positivos)
-                # Para evitar falsos positivos vindos de reflexos plásticos ou brilhos lisos na caixa:
-                # A) Canny edge ratio >= 0.04 (deve conter detalhes texturizados)
-                # B) Desvio padrão >= 15.0 (deve apresentar bom contraste local)
-                # C) Proporção de pixels escuros (< 120) >= 0.05 (deve conter texto impresso)
-                std_val = crop_gray_unpadded.std()
-                dark_ratio = np.sum(crop_gray_unpadded < 120) / float(area)
-                
-                crop_edges = cv2.Canny(crop_gray_unpadded, 30, 90)
-                edge_ratio = np.sum(crop_edges > 0) / float(area)
+        # 4. Extração de Contornos
+        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-                if edge_ratio >= 0.04 and std_val >= 15.0 and dark_ratio >= 0.05:
-                    crop_count += 1
+        for c in contours:
+            x, y, w, h = cv2.boundingRect(c)
+            area = w * h
+            cx = x + w/2
+
+            # 5. Filtragem Geométrica Básica
+            if w >= 60 and h >= 60 and area >= 4000 and w < 350 and h < 350:
+                if 250 < cx < 1030:
+                    crop_gray = img[y:y+h, x:x+w]
                     
-                    # 7. Margem de Segurança (Padding) de 20 pixels
-                    # Adicionamos uma margem de segurança ao redor do contorno para garantir
-                    # que nenhuma palavra ou texto nas bordas do rótulo/cinta seja cortado.
-                    pad = 20
-                    y1 = max(0, y - pad)
-                    y2 = min(img.shape[0], y + h + pad)
-                    x1 = max(0, x - pad)
-                    x2 = min(img.shape[1], x + w + pad)
-                    
-                    # Realiza o crop da imagem colorida se disponível, senão da cinza
-                    crop_to_save = img_color[y1:y2, x1:x2] if img_color is not None else img[y1:y2, x1:x2]
-                    
-                    # Salva a imagem segmentada
-                    base_name, _ = os.path.splitext(img_name)
-                    out_name = f"{base_name}_segmentada_{crop_count}.png"
-                    out_name = out_name.replace(":", "_")
-                    out_path = os.path.join(output_dir, out_name)
-                    cv2.imwrite(out_path, crop_to_save)
+                    min_val = crop_gray.min()
+                    std_val = crop_gray.std()
+                    mean_val = crop_gray.mean()
+                    lap_var = cv2.Laplacian(crop_gray, cv2.CV_64F).var()
 
-    return crop_count
+                    aspect = w / float(h)
+                    # Penaliza severamente contornos muito estreitos (como rugas ou dobras da caixa)
+                    if aspect < 0.5 or aspect > 2.5:
+                        aspect_penalty = 0.01
+                    else:
+                        aspect_penalty = 1.0
+
+                    # 6. Cálculo do Score de "Rótulo Real"
+                    # Combinamos área (area), brilho (mean_val), nitidez de texto (lap_var),
+                    # contraste (std_val), presença de tinta preta (255 - min_val) e penalidade de aspecto.
+                    score = area * mean_val * lap_var * std_val * (255.0 - min_val) * aspect_penalty
+
+                    candidates.append({
+                        'box': (x, y, w, h),
+                        'score': score
+                    })
+
+        if len(candidates) > 0:
+            break
+
+    # Se não houver candidatos, rodamos uma busca relaxada (segurança para imagens inéditas muito difíceis)
+    if len(candidates) == 0:
+        for p in [90, 85, 80]:
+            thresh_val = np.percentile(pixels_inside, p)
+            _, thresh = cv2.threshold(masked_img, thresh_val, 255, cv2.THRESH_BINARY)
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+            closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+            contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            for c in contours:
+                x, y, w, h = cv2.boundingRect(c)
+                area = w * h
+                cx = x + w/2
+                if w >= 40 and h >= 40 and area >= 1600 and w < 400 and h < 400:
+                    if 250 < cx < 1030:
+                        crop_gray = img[y:y+h, x:x+w]
+                        min_val = crop_gray.min()
+                        std_val = crop_gray.std()
+                        mean_val = crop_gray.mean()
+                        lap_var = cv2.Laplacian(crop_gray, cv2.CV_64F).var()
+
+                        aspect = w / float(h)
+                        if aspect < 0.5 or aspect > 2.5:
+                            aspect_penalty = 0.01
+                        else:
+                            aspect_penalty = 1.0
+
+                        score = area * mean_val * lap_var * std_val * (255.0 - min_val) * aspect_penalty
+
+                        candidates.append({
+                            'box': (x, y, w, h),
+                            'score': score
+                        })
+            if len(candidates) > 0:
+                break
+
+    if len(candidates) == 0:
+        return 0
+
+    # 7. Seleção do Melhor Candidato
+    best_cand = max(candidates, key=lambda x: x['score'])
+    x, y, w, h = best_cand['box']
+
+    # 8. Margem de Segurança (Padding) de 20 pixels
+    pad = 20
+    y1 = max(0, y - pad)
+    y2 = min(img.shape[0], y + h + pad)
+    x1 = max(0, x - pad)
+    x2 = min(img.shape[1], x + w + pad)
+
+    crop_to_save = img_color[y1:y2, x1:x2] if img_color is not None else img[y1:y2, x1:x2]
+
+    # Salva a imagem segmentada
+    base_name, _ = os.path.splitext(img_name)
+    out_name = f"{base_name}_segmentada_1.png"
+    out_name = out_name.replace(":", "_")
+    out_path = os.path.join(output_dir, out_name)
+    cv2.imwrite(out_path, crop_to_save)
+
+    return 1
 
 def process_dataset(input_dir, output_dir):
     if not os.path.exists(input_dir):
